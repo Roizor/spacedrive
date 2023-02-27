@@ -51,17 +51,27 @@ pub(super) async fn create_dir(
 	event: &Event,
 	library_ctx: &LibraryContext,
 ) -> Result<(), LocationManagerError> {
+	create_dir_by_path(location, &event.paths[0], library_ctx).await
+}
+
+pub(super) async fn create_dir_by_path(
+	location: &indexer_job_location::Data,
+	path: impl AsRef<Path>,
+	library_ctx: &LibraryContext,
+) -> Result<(), LocationManagerError> {
 	if location.node_id != library_ctx.node_local_id {
 		return Ok(());
 	}
 
+	let path = path.as_ref();
+
 	trace!(
 		"Location: <root_path ='{}'> creating directory: {}",
 		location.path,
-		event.paths[0].display()
+		path.display()
 	);
 
-	let Some(subpath) = subtract_location_path(&location.path, &event.paths[0]) else {
+	let Some(subpath) = subtract_location_path(&location.path, path) else {
         return Ok(());
     };
 
@@ -104,6 +114,15 @@ pub(super) async fn create_file(
 	event: &Event,
 	library_ctx: &LibraryContext,
 ) -> Result<(), LocationManagerError> {
+	create_file_by_path(location, &event.paths[0], library_ctx).await
+}
+
+pub(super) async fn create_file_by_path(
+	location: &indexer_job_location::Data,
+	path: impl AsRef<Path>,
+	library_ctx: &LibraryContext,
+) -> Result<(), LocationManagerError> {
+	let path = path.as_ref();
 	if location.node_id != library_ctx.node_local_id {
 		return Ok(());
 	}
@@ -111,12 +130,12 @@ pub(super) async fn create_file(
 	trace!(
 		"Location: <root_path ='{}'> creating file: {}",
 		&location.path,
-		event.paths[0].display()
+		path.display()
 	);
 
 	let db = &library_ctx.db;
 
-	let Some(materialized_path) = subtract_location_path(&location.path, &event.paths[0]) else { return Ok(()) };
+	let Some(materialized_path) = subtract_location_path(&location.path, path) else { return Ok(()) };
 
 	let Some(parent_directory) =
 		get_parent_dir(location.id, &materialized_path, library_ctx).await?
@@ -209,13 +228,7 @@ pub(super) async fn create_file(
 
 	trace!("object: {:#?}", object);
 	if !object.has_thumbnail && !created_file.extension.is_empty() {
-		generate_thumbnail(
-			&created_file.extension,
-			&cas_id,
-			&event.paths[0],
-			library_ctx,
-		)
-		.await;
+		generate_thumbnail(&created_file.extension, &cas_id, path, library_ctx).await;
 	}
 
 	invalidate_query!(library_ctx, "locations.getExplorerData");
@@ -351,6 +364,8 @@ pub(super) async fn rename(
 		.expect("Found non-UTF-8 path")
 		.to_string();
 
+	// TODO handle the case where a rename means a move to another directory in this location or outside the location which is actually a delete
+
 	if let Some(file_path) = get_existing_file_or_directory(location, old_path, library_ctx).await?
 	{
 		// If the renamed path is a directory, we have to update every successor
@@ -420,47 +435,74 @@ pub(super) async fn remove_event(
 ) -> Result<(), LocationManagerError> {
 	trace!("removed {remove_kind:#?}");
 
-	// if it doesn't either way, then we don't care
-	if let Some(file_path) =
-		get_existing_file_or_directory(location, &event.paths[0], library_ctx).await?
-	{
-		// check file still exists on disk
-		match fs::metadata(&event.paths[0]).await {
-			Ok(_) => {
-				todo!("file has changed in some way, re-identify it")
-			}
-			Err(e) if e.kind() == ErrorKind::NotFound => {
-				// if is doesn't, we can remove it safely from our db
-				if file_path.is_dir {
-					delete_directory(library_ctx, location.id, Some(file_path.materialized_path))
-						.await?;
-				} else {
+	remove_by_path(location, &event.paths[0], library_ctx).await
+}
+
+pub(super) async fn remove_by_path(
+	location: &indexer_job_location::Data,
+	path: impl AsRef<Path>,
+	library_ctx: &LibraryContext,
+) -> Result<(), LocationManagerError> {
+	let path = path.as_ref();
+
+	// if it doesn't exist either way, then we don't care
+	let Some(file_path) = get_existing_file_or_directory(
+		location,
+		path,
+		library_ctx
+	).await? else {
+		return Ok(());
+	};
+
+	remove_by_file_path(location, path, &file_path, library_ctx).await
+}
+
+pub(super) async fn remove_by_file_path(
+	location: &indexer_job_location::Data,
+	path: impl AsRef<Path>,
+	file_path: &file_path_with_object::Data,
+	library_ctx: &LibraryContext,
+) -> Result<(), LocationManagerError> {
+	// check file still exists on disk
+	match fs::metadata(path).await {
+		Ok(_) => {
+			todo!("file has changed in some way, re-identify it")
+		}
+		Err(e) if e.kind() == ErrorKind::NotFound => {
+			// if is doesn't, we can remove it safely from our db
+			if file_path.is_dir {
+				delete_directory(
+					library_ctx,
+					location.id,
+					Some(file_path.materialized_path.clone()),
+				)
+				.await?;
+			} else {
+				library_ctx
+					.db
+					.file_path()
+					.delete(file_path::location_id_id(location.id, file_path.id))
+					.exec()
+					.await?;
+
+				if let Some(object_id) = file_path.object_id {
 					library_ctx
 						.db
-						.file_path()
-						.delete(file_path::location_id_id(location.id, file_path.id))
+						.object()
+						.delete_many(vec![
+							object::id::equals(object_id),
+							// https://www.prisma.io/docs/reference/api-reference/prisma-client-reference#none
+							object::file_paths::none(vec![]),
+						])
 						.exec()
 						.await?;
-
-					if let Some(object_id) = file_path.object_id {
-						library_ctx
-							.db
-							.object()
-							.delete_many(vec![
-								object::id::equals(object_id),
-								// https://www.prisma.io/docs/reference/api-reference/prisma-client-reference#none
-								object::file_paths::none(vec![]),
-							])
-							.exec()
-							.await?;
-					}
 				}
 			}
-			Err(e) => return Err(e.into()),
 		}
-
-		invalidate_query!(library_ctx, "locations.getExplorerData");
+		Err(e) => return Err(e.into()),
 	}
+
+	invalidate_query!(library_ctx, "locations.getExplorerData");
 
 	Ok(())
 }
@@ -504,7 +546,7 @@ async fn get_existing_file_path(
 		.map_err(Into::into)
 }
 
-async fn get_existing_file_or_directory(
+pub(super) async fn get_existing_file_or_directory(
 	location: &indexer_job_location::Data,
 	path: impl AsRef<Path>,
 	library_ctx: &LibraryContext,
